@@ -1,17 +1,20 @@
 """
 BTC address index builder — free stack:
   AWS Public Blockchain Data (s3://aws-public-blockchain, no keys, no egress cost)
-  -> DuckDB (local aggregation)
+  -> DuckDB (on-disk, incremental, self-compacting)
   -> Hugging Face dataset (free storage, used by app.py as BTCINDEXREPO)
 
-Runs incrementally: on each run it only processes the days between the
-previous manifest's last_day and yesterday, then re-publishes the
-partitioned parquet files + manifest.json to the HF dataset repo.
+v3: fixes the OOM seen in run #1 (DuckDB temp dir filled to 47.2GiB during
+the final GROUP BY). Root cause: the raw `addr` table kept one row per
+address PER DAY it appeared, growing unbounded across the whole backfill.
+Now the table is compacted (deduplicated in place) after every checkpoint,
+so it never holds more than one row per unique address.
 
 Required env vars:
-  HF_TOKEN   - Hugging Face token with WRITE access to the dataset repo
-  HF_REPO    - dataset repo id, e.g. "yourname/btc-address-index"
-  INDEX_FROM - first day to index if the dataset does not exist yet (YYYY-MM-DD)
+  HF_TOKEN        - Hugging Face token with WRITE access to the dataset repo
+  HF_REPO         - dataset repo id, e.g. "yourname/btc-address-index"
+  INDEX_FROM      - first day to index if the dataset does not exist yet (YYYY-MM-DD)
+  CHECKPOINT_DAYS - optional, days per checkpoint publish (default 10)
 """
 import glob
 import json
@@ -26,20 +29,78 @@ from huggingface_hub import HfApi, hf_hub_download, upload_folder
 HF_TOKEN = os.environ["HF_TOKEN"]
 HF_REPO = os.environ["HF_REPO"]
 INDEX_FROM = os.environ.get("INDEX_FROM", "").strip() or "2025-01-01"
+CHECKPOINT_DAYS = int(os.environ.get("CHECKPOINT_DAYS", "10"))
 
 WORK = "work"
 PRE_DIR = os.path.join(WORK, "pre")
 SUF_DIR = os.path.join(WORK, "suf")
 SNAP = os.path.join(WORK, "snapshot.parquet")
+DB_PATH = os.path.join(WORK, "idx.duckdb")
 
 
 def log(msg: str) -> None:
     print(f"[btc-index] {msg}", flush=True)
 
 
+def compact(con) -> None:
+    """Deduplicate addr in place so it never grows past one row per address."""
+    con.execute("""
+        CREATE OR REPLACE TABLE addr_new AS
+        SELECT address, max(last_seen) AS last_seen FROM addr GROUP BY 1
+    """)
+    con.execute("DROP TABLE addr")
+    con.execute("ALTER TABLE addr_new RENAME TO addr")
+
+
+def publish_from_addr(con, manifest_first_day: str, last_day: str) -> None:
+    for p in glob.glob(os.path.join(PRE_DIR, "**"), recursive=True):
+        if os.path.isfile(p):
+            os.remove(p)
+    for p in glob.glob(os.path.join(SUF_DIR, "**"), recursive=True):
+        if os.path.isfile(p):
+            os.remove(p)
+
+    con.execute(f"COPY addr TO '{SNAP}' (FORMAT PARQUET)")
+
+    con.execute(f"""
+        COPY (SELECT address, last_seen, substr(address, 1, 2) AS bucket FROM addr)
+        TO '{PRE_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)
+    """)
+    con.execute(f"""
+        COPY (SELECT reverse(address) AS reverse, last_seen,
+                     substr(reverse(address), 1, 2) AS bucket FROM addr)
+        TO '{SUF_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)
+    """)
+
+    pre_files = sorted(glob.glob(os.path.join(PRE_DIR, "**", "*.parquet"), recursive=True))
+    suf_files = sorted(glob.glob(os.path.join(SUF_DIR, "**", "*.parquet"), recursive=True))
+    pre_rel = [os.path.relpath(f, WORK).replace("\\", "/") for f in pre_files]
+    suf_rel = [os.path.relpath(f, WORK).replace("\\", "/") for f in suf_files]
+
+    manifest_out = {
+        "first_day": manifest_first_day,
+        "last_day": last_day,
+        "files": {"pre": pre_rel, "suf": suf_rel},
+    }
+    with open(os.path.join(WORK, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest_out, f)
+
+    upload_folder(
+        repo_id=HF_REPO,
+        repo_type="dataset",
+        folder_path=WORK,
+        path_in_repo=".",
+        token=HF_TOKEN,
+        allow_patterns=["pre/**", "suf/**", "manifest.json", "snapshot.parquet"],
+        commit_message=f"index checkpoint through {last_day}",
+    )
+    log(f"checkpoint published: last_day={last_day}, pre_files={len(pre_rel)}, suf_files={len(suf_rel)}")
+
+
 def main() -> None:
     os.makedirs(PRE_DIR, exist_ok=True)
     os.makedirs(SUF_DIR, exist_ok=True)
+    os.makedirs(os.path.join(WORK, "tmp"), exist_ok=True)
 
     api = HfApi(token=HF_TOKEN)
     api.create_repo(repo_id=HF_REPO, repo_type="dataset", exist_ok=True)
@@ -53,19 +114,22 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         log(f"no existing manifest ({e}); building from scratch from {INDEX_FROM}")
 
-    con = duckdb.connect(os.path.join(WORK, "idx.duckdb"))
+    con = duckdb.connect(DB_PATH)
     con.execute("INSTALL httpfs; LOAD httpfs; SET s3_region='us-east-2';")
     con.execute("SET enable_progress_bar=false;")
+    con.execute("SET preserve_insertion_order=false;")  # critical: avoids huge sort/temp spill
+    con.execute("SET threads=2;")
+    con.execute("SET memory_limit='10GB';")
+    con.execute(f"SET temp_directory='{os.path.join(WORK, 'tmp')}';")
     con.execute("CREATE TABLE IF NOT EXISTS addr(address VARCHAR, last_seen TIMESTAMP)")
 
-    have_snapshot = False
     if manifest:
         try:
             p = hf_hub_download(repo_id=HF_REPO, filename="snapshot.parquet",
                                  repo_type="dataset", token=HF_TOKEN)
             shutil.copy(p, SNAP)
-            con.execute(f"INSERT INTO addr SELECT * FROM read_parquet('{SNAP}')")
-            have_snapshot = True
+            if con.execute("SELECT count(*) FROM addr").fetchone()[0] == 0:
+                con.execute(f"INSERT INTO addr SELECT * FROM read_parquet('{SNAP}')")
             log("loaded previous snapshot into DuckDB")
         except Exception as e:  # noqa: BLE001
             log(f"could not load previous snapshot: {e}")
@@ -73,14 +137,14 @@ def main() -> None:
     first_day = manifest["first_day"] if manifest else INDEX_FROM
     start = (date.fromisoformat(manifest["last_day"]) + timedelta(days=1)
              if manifest else date.fromisoformat(INDEX_FROM))
-    end = date.today() - timedelta(days=1)  # only fully-closed days
+    end = date.today() - timedelta(days=1)
 
     if start > end:
         log("nothing new to index (already up to date)")
         sys.exit(0)
 
-    processed_any = False
     last_ok = manifest["last_day"] if manifest else None
+    days_since_checkpoint = 0
     d = start
     while d <= end:
         path = f"s3://aws-public-blockchain/v1.0/btc/transactions/date={d.isoformat()}/*.parquet"
@@ -95,71 +159,31 @@ def main() -> None:
         """
         try:
             con.execute(sql)
-            processed_any = True
             last_ok = d.isoformat()
+            days_since_checkpoint += 1
             log(f"indexed {d.isoformat()}")
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             if "No files found" in msg or "404" in msg:
                 log(f"{d.isoformat()}: no data yet, stopping for this run")
             else:
-                log(f"{d.isoformat()}: error, stopping for this run: {msg[:200]}")
+                log(f"{d.isoformat()}: error, stopping for this run: {msg[:300]}")
             break
+
+        if days_since_checkpoint >= CHECKPOINT_DAYS:
+            compact(con)
+            publish_from_addr(con, first_day, last_ok)
+            days_since_checkpoint = 0
+
         d += timedelta(days=1)
 
-    if not processed_any and have_snapshot:
-        log("no new days processed and snapshot already exists; exiting")
-        sys.exit(0)
+    if days_since_checkpoint > 0 or last_ok != (manifest["last_day"] if manifest else None):
+        compact(con)
+        publish_from_addr(con, first_day, last_ok)
+    else:
+        log("no new days processed since last checkpoint")
 
-    con.execute("""
-        CREATE OR REPLACE TABLE addr_final AS
-        SELECT address, max(last_seen) AS last_seen FROM addr GROUP BY 1
-    """)
-
-    con.execute(f"COPY addr_final TO '{SNAP}' (FORMAT PARQUET)")
-
-    for p in glob.glob(os.path.join(PRE_DIR, "**"), recursive=True):
-        if os.path.isfile(p):
-            os.remove(p)
-    for p in glob.glob(os.path.join(SUF_DIR, "**"), recursive=True):
-        if os.path.isfile(p):
-            os.remove(p)
-
-    con.execute(f"""
-        COPY (SELECT address, last_seen, substr(address, 1, 2) AS bucket
-              FROM addr_final)
-        TO '{PRE_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)
-    """)
-    con.execute(f"""
-        COPY (SELECT reverse(address) AS reverse, last_seen,
-                     substr(reverse(address), 1, 2) AS bucket
-              FROM addr_final)
-        TO '{SUF_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)
-    """)
-
-    pre_files = sorted(glob.glob(os.path.join(PRE_DIR, "**", "*.parquet"), recursive=True))
-    suf_files = sorted(glob.glob(os.path.join(SUF_DIR, "**", "*.parquet"), recursive=True))
-    pre_rel = [os.path.relpath(f, WORK).replace("\\", "/") for f in pre_files]
-    suf_rel = [os.path.relpath(f, WORK).replace("\\", "/") for f in suf_files]
-
-    manifest_out = {
-        "first_day": first_day,
-        "last_day": last_ok,
-        "files": {"pre": pre_rel, "suf": suf_rel},
-    }
-    with open(os.path.join(WORK, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest_out, f)
-
-    upload_folder(
-        repo_id=HF_REPO,
-        repo_type="dataset",
-        folder_path=WORK,
-        path_in_repo=".",
-        token=HF_TOKEN,
-        allow_patterns=["pre/**", "suf/**", "manifest.json", "snapshot.parquet"],
-        commit_message=f"index update through {last_ok}",
-    )
-    log(f"done, last_day={last_ok}, pre_files={len(pre_rel)}, suf_files={len(suf_rel)}")
+    log(f"run complete, last_day={last_ok}")
 
 
 if __name__ == "__main__":
