@@ -1,14 +1,15 @@
 """
 BTC address index builder — free stack:
   AWS Public Blockchain Data (s3://aws-public-blockchain, no keys, no egress cost)
-  -> DuckDB (on-disk, incremental, self-compacting)
+  -> DuckDB (on-disk, upsert-based, bounded size)
   -> Hugging Face dataset (free storage, used by app.py as BTCINDEXREPO)
 
-v3: fixes the OOM seen in run #1 (DuckDB temp dir filled to 47.2GiB during
-the final GROUP BY). Root cause: the raw `addr` table kept one row per
-address PER DAY it appeared, growing unbounded across the whole backfill.
-Now the table is compacted (deduplicated in place) after every checkpoint,
-so it never holds more than one row per unique address.
+v4: the `addr` table now has a PRIMARY KEY on address and every day is
+merged via INSERT ... ON CONFLICT DO UPDATE. This means the table can
+never hold more than one row per unique address — it is bounded by
+construction, not by a periodic compaction step. This is the fix for the
+OOM seen in v1/v2 (temp dir filling to 47.2GiB from unbounded duplicate
+rows: one row per address PER DAY it appeared).
 
 Required env vars:
   HF_TOKEN        - Hugging Face token with WRITE access to the dataset repo
@@ -42,17 +43,7 @@ def log(msg: str) -> None:
     print(f"[btc-index] {msg}", flush=True)
 
 
-def compact(con) -> None:
-    """Deduplicate addr in place so it never grows past one row per address."""
-    con.execute("""
-        CREATE OR REPLACE TABLE addr_new AS
-        SELECT address, max(last_seen) AS last_seen FROM addr GROUP BY 1
-    """)
-    con.execute("DROP TABLE addr")
-    con.execute("ALTER TABLE addr_new RENAME TO addr")
-
-
-def publish_from_addr(con, manifest_first_day: str, last_day: str) -> None:
+def publish(con, manifest_first_day: str, last_day: str) -> None:
     for p in glob.glob(os.path.join(PRE_DIR, "**"), recursive=True):
         if os.path.isfile(p):
             os.remove(p)
@@ -62,15 +53,15 @@ def publish_from_addr(con, manifest_first_day: str, last_day: str) -> None:
 
     con.execute(f"COPY addr TO '{SNAP}' (FORMAT PARQUET)")
 
-    con.execute(f"""
-        COPY (SELECT address, last_seen, substr(address, 1, 2) AS bucket FROM addr)
-        TO '{PRE_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)
-    """)
-    con.execute(f"""
-        COPY (SELECT reverse(address) AS reverse, last_seen,
-                     substr(reverse(address), 1, 2) AS bucket FROM addr)
-        TO '{SUF_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)
-    """)
+    con.execute(
+        f"COPY (SELECT address, last_seen, substr(address, 1, 2) AS bucket FROM addr) "
+        f"TO '{PRE_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)"
+    )
+    con.execute(
+        f"COPY (SELECT reverse(address) AS reverse, last_seen, "
+        f"substr(reverse(address), 1, 2) AS bucket FROM addr) "
+        f"TO '{SUF_DIR}' (FORMAT PARQUET, PARTITION_BY (bucket), OVERWRITE_OR_IGNORE 1)"
+    )
 
     pre_files = sorted(glob.glob(os.path.join(PRE_DIR, "**", "*.parquet"), recursive=True))
     suf_files = sorted(glob.glob(os.path.join(SUF_DIR, "**", "*.parquet"), recursive=True))
@@ -117,11 +108,12 @@ def main() -> None:
     con = duckdb.connect(DB_PATH)
     con.execute("INSTALL httpfs; LOAD httpfs; SET s3_region='us-east-2';")
     con.execute("SET enable_progress_bar=false;")
-    con.execute("SET preserve_insertion_order=false;")  # critical: avoids huge sort/temp spill
+    con.execute("SET preserve_insertion_order=false;")
     con.execute("SET threads=2;")
     con.execute("SET memory_limit='10GB';")
     con.execute(f"SET temp_directory='{os.path.join(WORK, 'tmp')}';")
-    con.execute("CREATE TABLE IF NOT EXISTS addr(address VARCHAR, last_seen TIMESTAMP)")
+    # PRIMARY KEY -> table can never exceed one row per unique address
+    con.execute("CREATE TABLE IF NOT EXISTS addr(address VARCHAR PRIMARY KEY, last_seen TIMESTAMP)")
 
     if manifest:
         try:
@@ -156,6 +148,8 @@ def main() -> None:
                        block_timestamp AS t
                 FROM read_parquet('{path}')
             ) GROUP BY 1
+            ON CONFLICT (address) DO UPDATE SET
+                last_seen = GREATEST(excluded.last_seen, addr.last_seen)
         """
         try:
             con.execute(sql)
@@ -171,15 +165,13 @@ def main() -> None:
             break
 
         if days_since_checkpoint >= CHECKPOINT_DAYS:
-            compact(con)
-            publish_from_addr(con, first_day, last_ok)
+            publish(con, first_day, last_ok)
             days_since_checkpoint = 0
 
         d += timedelta(days=1)
 
     if days_since_checkpoint > 0 or last_ok != (manifest["last_day"] if manifest else None):
-        compact(con)
-        publish_from_addr(con, first_day, last_ok)
+        publish(con, first_day, last_ok)
     else:
         log("no new days processed since last checkpoint")
 
