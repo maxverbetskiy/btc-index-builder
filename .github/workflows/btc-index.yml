@@ -1,0 +1,32 @@
+name: BTC address index
+
+on:
+  schedule:
+    - cron: '30 3 * * *'   # daily at 03:30 UTC, adjust as needed
+  workflow_dispatch:
+    inputs:
+      index_from:
+        description: 'Start date if building the index from scratch (YYYY-MM-DD)'
+        required: false
+        default: ''
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install duckdb huggingface_hub
+
+      - name: Build / update BTC index
+        env:
+          HF_TOKEN: ${{ secrets.HFTOKEN }}
+          HF_REPO: ${{ vars.HFREPO }}
+          INDEX_FROM: ${{ github.event.inputs.index_from || vars.INDEXFROM }}
+        run: python btc_index_builder.py
